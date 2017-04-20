@@ -1,0 +1,261 @@
+---
+title: "Simulating Unobservable Spatial Locations with Bayesian Multidimensional Scaling"
+author: "Robert Kubinec"
+output: html_notebook
+---
+
+```{r libraries, message=FALSE, warning=FALSE}
+
+require(dplyr)
+require(tidyr)
+require(rstan)
+require(bayesplot)
+require(abind)
+require(trelliscopejs)
+
+```
+
+
+This code samples $W_{tc}$ wifi locations and $U_{tc}$ user locations from a 2-dimensional plane as a series of coordinates from independent normal distributions $N~(0,10)$ ($t$ for true, $c$ for coordinate, i.e., latitude or longitude). These true locations are unobserved because the data we have from the supermarket only includes noisy measurements, either in terms of wifi signal strength or GPS (longitude/latitude). Accepting either GPS or wifi locations as "true" data will potentially bias estimates by giving the model false precision. Thus I also sample coordinates with measurement error $N~(0,0.25)$ for wifi locations and $N~(0,1)$ for longitude/latitude locations resulting in $W_{oc}$ and $U_{oc}$ ($o$ for observed). Furthermore, the wifi locations $W_{tc}$ are sampled from a series of clusters $C_{sc}$ reflecting the fact that each wifi router belongs to a sub-net, and so we should model the resulting clustering of wifi routers in similar locations.
+
+Finally, distances between the wifi router locations and GPS coordinates of the users are calculated using Euclidean distances $D_oc$. This reflects the nature of the data, which has GPS coordinates at individual time points along with a series of observations of wifi signal strength, which can be converted to distances in feet.
+
+Multidimensional scaling is an appropriate choice for this modeling problem because it finds the points that will minimize the errors of the observed distances between points. Given real distances between spatial locations, such as cities, MDS is able to reconstruct a correct map of the locations based on distances between points. The Bayesian version of MDS is particularly appropriate because it allows us to modify the estimation to take into account the nature of supermarket data as well as to incorporate prior information about the types of beacons and signals we are processing.
+
+In essence, the simulation is as follows:
+
+$$
+\begin{aligned}
+\sum_{t=1}^{T} \sum^2_{c=1} U_{tc} &\sim N(0,10)\\
+\sum_{s=1}^{S} \sum^2_{c=1} C_{sc} &\sim N(0,10)\\
+\sum_{t=1}^{T} \sum^2_{c=1} W_{tc} &\sim N(C_{sc},1)\\
+\sum_{o=1}^{O} \sum^2_{c=1} U_{oc} &\sim N(U_{tc},1)\\
+\sum_{o=1}^{O} \sum^2_{c=1} W_{oc} &\sim N(W_{tc},.25)\\
+
+\sum_{o=1}^{O} \sum^2_{c=1} D_{oc} &= \sqrt(W_{oc}-U_{oc})^2
+
+\end{aligned}
+$$
+
+```{r setup}
+
+# model parameters --------------------------------------------------------
+
+niter <- 2000
+nwarmup <- 1000
+num_points <- 50
+test_fix <- 2
+err_sd_wifi <- .25
+err_sd_gps <- 1
+true_sd <- 10
+
+true_points_gps <- matrix(nrow=num_points,c(rnorm(num_points,0,true_sd),rnorm(num_points,0,true_sd)))
+true_points_clust <- matrix(nrow=num_points/true_sd,c(rnorm(num_points/true_sd,0,true_sd),rnorm(num_points/true_sd,0,true_sd)))
+
+true_points_wifi <- apply(true_points_clust,2, function(x) {
+  x <- sapply(x,function(x) rnorm(n=10,mean=x))
+})
+
+obs_points_gps <- apply(true_points_gps,c(1,2),function(x) rnorm(n=1,mean=x,sd=err_sd_gps))
+obs_points_wifi <- apply(true_points_wifi,c(1,2), function(x) rnorm(n=1,mean=x,sd=err_sd_wifi))
+distance_obs <- proxy::dist(c(rbind(obs_points_wifi,obs_points_gps))) %>% as.matrix() 
+
+```
+
+We can show the data by plotting observed and true locations. Below is the simulated data in long form.
+
+```{r long_data}
+
+plot_data <- bind_cols(as_data_frame(rbind(obs_points_wifi,obs_points_gps)),
+                       as_data_frame(rbind(true_points_wifi,true_points_gps)))
+names(plot_data) <- c('Observed_Lat','Observed_Lon','True_Lat','True_Lon')
+plot_data <- mutate(plot_data,type=rep(c('wifi','gps'),each=num_points),id=1:n(),
+                    point_id=rep(1:num_points,2),
+                    clust_id=c(paste0('clust_',rep(1:5,each=true_sd)),rep(NA,num_points)))
+
+plot_data <-  gather(plot_data,source,coordinate,-type,-id,-clust_id,-point_id) %>% separate(source,into=c('source','dimension')) %>%
+  spread(key = dimension,value = coordinate)
+
+DT::datatable(plot_data)
+
+
+```
+
+And here is a plot of observed versus true locations for wifi and GPS coordinates.
+
+```{r sim_plot}
+ggplot(plot_data,aes(y=Lat,x=Lon,shape=source,colour=source)) + geom_point() + theme_minimal() +
+  facet_wrap(~type)
+```
+
+
+We see here that the coordinates are pretty close to each other. As a final step, we simulate a process where a user walks through the store from GPS location to GPS location. At each step, the cell phone records distances to all wifi beacons, although any beacons with a distance larger than 10 feet are removed due to the limitations of signal strength. That leaves 749 records or an average of `r round(749/num_points)` beacon signals per longitude/latitude coordinate.
+
+```{r walk}
+
+gps_data <- filter(plot_data,source=='Observed',type=='gps') %>% select(point_id,Lat,Lon)
+wifi_data <- filter(plot_data,source=='Observed',type=='wifi') %>% select(point_id,clust_id,Lat,Lon)
+
+euclid_dist <- data_frame(distance=c(sapply(gps_data$point_id, function(x) {
+  gps_coord <- filter(gps_data,point_id==x)
+  distance <- sapply(wifi_data$point_id, function(y) {
+    wifi_coord <- filter(wifi_data,point_id==y)
+    out_dist <- sqrt((gps_coord$Lat - wifi_coord$Lat)^2 + (gps_coord$Lon - wifi_coord$Lon)^2)
+    })
+  return(distance)
+})),
+point_id=rep(gps_data$point_id,each=num_points),wifi_id=rep(wifi_data$point_id,num_points))
+
+simul_data <- left_join(plot_data,euclid_dist,by='point_id') %>% group_by(point_id) %>%
+  filter(type=='gps',source=='Observed',distance<10) %>% 
+  left_join(select(wifi_data,point_id,clust_id),by=c('wifi_id'='point_id'))
+
+DT::datatable(select(simul_data,point_id,wifi_id,clust_id.y,Lat,Lon,distance),rownames=FALSE)
+
+```
+
+Now that we have generated data from first principles, we can look at how various models perform at guessing true user locations. First we can examine a relatively straightforward hiearchical linear model where longitude/latitude is the outcome and distance to wifi signals are the predictors. In this model I include a random intercept for cluster location and a 3-order polynomial for wifi distance. The model is fit in Stan using the ``rstan`` package.
+
+```{r hier_lin}
+
+# produce model matrix for Stan
+
+theta <- model.matrix(~distance + I(distance^2) + I(distance^3),data = simul_data)[,-1]
+
+stan_data <- list(N=nrow(simul_data),
+                  J=ncol(theta),
+                  X=theta,
+                  longitude=simul_data$Lon,
+                  latitude=simul_data$Lat,
+                  G=num_points/true_sd,
+                  cl=as.numeric(factor(simul_data$clust_id.y)))
+
+compiled <- stan_model(file='hier_linear.stan')
+
+hier_lin <- sampling(compiled,iter=niter,warmup=nwarmup,chains=4,cores=4,data=stan_data)
+
+```
+
+We can now take the predicted latitude/longitude coordinates and compare those to the ground-truth coordinates through residual plots. I take the average of the lat/lon predictions and then calculate an uncertainty interval over the draws from the joint posterior.
+
+```{r plot_err}
+
+post <- rstan::extract(hier_lin,permuted=T)
+sample_rows <- sample(1:(2*niter),500)
+latitude <- sapply(sample_rows, function(i) {
+
+  out_lat <- sapply(1:nrow(simul_data),function(n) {
+    out_row <- post$loc_lat[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lat[i,]
+  })
+})
+
+longitude <- sapply(sample_rows, function(i) {
+  out_lat <- sapply(1:nrow(simul_data),function(n) {
+    out_row <- post$loc_lon[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lon[i,]
+  })
+})
+
+out_data <- data_frame(lat_mean=apply(latitude,1,mean),
+                       lat_sd=apply(latitude,1,sd),
+                       lon_mean=apply(longitude,1,mean),
+                       lon_sd=apply(longitude,1,sd),obs_lat=simul_data$Lat,
+                       obs_lon=simul_data$Lat,orig_pts=simul_data$point_id)
+# merge with true estimates
+out_data <- left_join(out_data,plot_data,by=c('orig_pts'='point_id')) %>% 
+  filter(type=='gps',source=='True')
+
+ggplot(out_data,aes(y=lon_mean,x=lat_mean)) + geom_point(colour='blue',size=1.5) +
+  geom_point(aes(y=Lat,x=Lon),colour='red',size=1.5,shape=3) + theme_minimal() +
+  geom_point(data=filter(plot_data,source=='True',type=='wifi'),aes(y=Lat,x=Lon),shape=4,colour='green')
+
+```
+
+In this plot, the predicted values are in blue, the true locations are red crosses, and the true wifi beacon locations are in green. What the plot shows is that the model pulls the longitude/latitude values towards the wifi beacons, but is unable to correct for much of the measurement error without clumping all points together. Thus what is necessary is to account for the spatial relationships in the data directly.
+
+We can model the relationship directly via multi-dimensional scaling (MDS) as mentioned earlier. In particular, we can account for both measurement error in wifi signals and gps signals simultaneously through the following equation, which is simply the observed locations of the wifi beacons and the longitude/latitude coordinates:
+
+$$
+D_{oc} = \sqrt(W_{oc}-U_{oc})^2
+$$
+
+However, we model this via a Bayesian estimation so that we can estimate $W_{oc}$ and $U_{oc}$ simultaneously as parameters not as data (data should be measured without error). We assign priors to $W_{oc}$ and $U_{oc}$ that reflect our knowledge of where these locations are. For $W_{oc}$, we can predict locations using a simple linear model given observed signal distances. For $U_{oc}$, we similarly use the GPS coordinates in our data. These priors help anchor the parameter estimates.
+
+```{r calculate}
+
+simul_data$wifi_id <- as.numeric(factor(simul_data$wifi_id))
+simul_data$clust_id.y <- as.numeric(factor(simul_data$clust_id.y))
+
+# first calculate average wifi location 
+
+wifi_loc <- lapply(1:max(simul_data$wifi_id),
+                   function(beacon) {
+                     lm_data <- filter(simul_data,wifi_id==beacon)
+                     beacon_lat <- lm(Lat~distance + I(distance^2) + I(distance^3),
+                                  data=lm_data)
+                     beacon_lon <- lm(Lon~distance + I(distance^2) + I(distance^3),
+                                  data=lm_data)
+                     beacon_pred_lat <- predict(beacon_lat, newdata=data_frame(distance=0), 
+                                                se.fit=TRUE)
+                     beacon_pred_lon <- predict(beacon_lon, newdata=data_frame(distance=0), 
+                                                se.fit=TRUE)
+                     return(data_frame(lat_pred=beacon_pred_lat$fit,
+                            lon_pred=beacon_pred_lon$fit,
+                            lat_sd=beacon_pred_lat$se.fit,
+                            lon_sd=beacon_pred_lon$se.fit))
+                   }) %>% bind_rows()
+#if not enough data to estimate standard error, use the max of the estimates
+
+wifi_loc <- mutate(wifi_loc,lat_sd=coalesce(lat_sd,max(lat_sd,na.rm=TRUE)),
+                   lon_sd=coalesce(lon_sd,max(lon_sd,na.rm=TRUE)),
+                   wifi_id=1:max(simul_data$wifi_id))
+wifi_loc <- left_join(wifi_loc,select(ungroup(simul_data),clust_id.y,wifi_id),by='wifi_id') %>% 
+  distinct(.keep_all=TRUE)
+sum_wifi <- group_by(wifi_loc,clust_id.y) %>% summarize_all(mean)
+wifi_matrix <- as.matrix(select(sum_wifi,lat_pred,lon_pred))
+sd_matrix <- as.matrix(select(sum_wifi,lat_sd,lon_sd))
+
+
+compiled <- stan_model(model_name = 'MDSBayes',file = 'stan_mds_full.stan')
+
+stan_data <- list(N=nrow(simul_data),
+                  W=max(simul_data$wifi_id),
+                  C=length(unique(simul_data$clust_id.y)),
+                  clust_id=wifi_loc$clust_id.y,
+                  wifi_id=simul_data$wifi_id,
+                  lat_meas=simul_data$Lat,
+                  lon_meas=simul_data$Lon,
+                  points_dist=simul_data$distance,
+                  wifi_center=wifi_matrix,
+                  wifi_sd=sd_matrix)
+
+bayesmds <- sampling(compiled,chains=4,cores=4,iter=niter,warmup=nwarmup,data=stan_data)
+
+
+```
+
+  
+```{r plot}
+to_plot_params <- lapply(all_sims,function(x) {
+  all_out <- as.array(x)
+  all_pars <- attributes(all_out)$dimnames$parameters
+  all_out <- all_out[,,grepl('full\\[',all_pars)]  
+  return(all_out)
+})
+
+to_plot_data <- lapply(to_plot_params,function(x) {
+  outplot <- mcmc_recover_intervals(x,true=c(true_points))
+  return(outplot$data)
+})
+
+combine_data <- bind_rows(to_plot_data)
+
+combine_data$Batch <- factor(paste0(rep(1:test_fix,each=(num_points*2)),'_Fixed'))
+combine_data <- gather(combine_data,type,estimate,True,Point)
+
+ggplot(combine_data,aes(y=estimate,x=reorder(Parameter,estimate),colour=type)) + geom_point(aes(shape=type),size=1.5) + 
+  geom_linerange(aes(ymin=l,ymax=u)) +
+  theme_minimal() +
+  facet_trelliscope(~Batch) +
+  theme(panel.grid = element_blank()) +
+  scale_color_brewer(palette='Paired')
+```

@@ -20,6 +20,8 @@ This code samples $I$ locations from a 2-dimensional plane as a series of coordi
 
 Multidimensional scaling is an appropriate choice for this modeling problem because it finds the points that will minimize the errors of the observed distances between points. Given real distances between spatial locations, such as cities, MDS is able to reconstruct a correct map of the locations based on distances between points. The Bayesian version of MDS is particularly appropriate because it allows us to modify the estimation to take into account the nature of supermarket data as well as to incorporate prior information about the types of beacons and signals we are processing.
 
+To incorporate measurement error, I 
+
 ```{r setup}
 
 # model parameters --------------------------------------------------------
