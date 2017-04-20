@@ -1,0 +1,98 @@
+---
+title: "Simulating Unobservable Spatial Locations with Bayesian Multidimensional Scaling"
+author: "Robert Kubinec"
+output: html_notebook
+---
+
+```{r libraries}
+
+require(dplyr)
+require(tidyr)
+require(rstan)
+require(bayesplot)
+require(abind)
+require(trelliscopejs)
+
+```
+
+
+This code samples $I$ locations from a 2-dimensional plane as a series of coordinates from independent normal distributions $N~(0,10)$. The Euclidean distances $\sum_{d=1}^{2}\sum^{I}_{i<j} \sqrt (x_{id} - x_{jd})^2$ between each pairwise combination of points are calculated through the ``proxy::dist`` function, returning a matrix of relative distances between each points. These distances between points are considered the observed information, while the points themselves are unobserved, as is the case with the supermarket data. In the supermarket, we only have access to distances to the current user location from wifi and bluetooth beacons, but we do not know the true location of the users or the true locations of the beacons. 
+
+Multidimensional scaling is an appropriate choice for this modeling problem because it finds the points that will minimize the errors of the observed distances between points. Given real distances between spatial locations, such as cities, MDS is able to reconstruct a correct map of the locations based on distances between points. The Bayesian version of MDS is particularly appropriate because it allows us to modify the estimation to take into account the nature of supermarket data as well as to incorporate prior information about the types of beacons and signals we are processing.
+
+```{r setup}
+
+# model parameters --------------------------------------------------------
+
+niter <- 2000
+nwarmup <- 1000
+num_points <- 50
+test_fix <- 2
+
+true_points <- matrix(nrow=num_points,c(rnorm(num_points,0,10),rnorm(num_points,0,10)))
+
+distance_true <- proxy::dist(true_points) %>% as.matrix() 
+
+# Add lognormal errors
+
+distance_obs <- apply(distance_true,c(1,2),function(x) {
+  x <- x + rlnorm(1)
+}) %>% as_data_frame()
+```
+
+
+
+
+```{r calculate}
+# put data in long form so that each point is matched with each other point exactly once
+# total of n(n-1)/2 pairs
+
+long_dist <- gather(distance_obs,edge1,distance) %>% mutate(edge2=rep(1:num_points,num_points)) %>% 
+  group_by(edge1) %>% 
+  mutate(unnecessary=if_else((edge1>edge2) | (edge1==edge2),T,F)) %>% 
+  filter(!unnecessary) %>% ungroup
+
+compiled <- stan_model(model_name = 'MDSBayes',file = 'stan_mds.stan')
+
+# Check to see how many fixed points we need for identification
+
+all_sims <- lapply(1:test_fix,function(i) { 
+fixed_points <- matrix(true_points[1:i,],ncol=2)
+
+stan_data <- list(J=num_points,
+                  num_dist=nrow(long_dist),
+                  points_fix_num=i,
+                  points_id=select(long_dist,edge1,edge2),
+                  points_dist=long_dist$distance,
+                  points_fix_vals=fixed_points)
+output <- sampling(compiled,chains=4,cores=4,iter=niter,warmup=nwarmup,data=stan_data)
+})
+
+```
+
+  
+```{r plot}
+to_plot_params <- lapply(all_sims,function(x) {
+  all_out <- as.array(x)
+  all_pars <- attributes(all_out)$dimnames$parameters
+  all_out <- all_out[,,grepl('full\\[',all_pars)]  
+  return(all_out)
+})
+
+to_plot_data <- lapply(to_plot_params,function(x) {
+  outplot <- mcmc_recover_intervals(x,true=c(true_points))
+  return(outplot$data)
+})
+
+combine_data <- bind_rows(to_plot_data)
+
+combine_data$Batch <- factor(paste0(rep(1:test_fix,each=(num_points*2)),'_Fixed'))
+combine_data <- gather(combine_data,type,estimate,True,Point)
+
+ggplot(combine_data,aes(y=estimate,x=reorder(Parameter,estimate),colour=type)) + geom_point(aes(shape=type),size=1.5) + 
+  geom_linerange(aes(ymin=l,ymax=u)) +
+  theme_minimal() +
+  facet_trelliscope(~Batch) +
+  theme(panel.grid = element_blank()) +
+  scale_color_brewer(palette='Paired')
+```
