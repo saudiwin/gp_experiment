@@ -31,9 +31,7 @@ $$
 \sum_{t=1}^{T} \sum^2_{c=1} W_{tc} &\sim N(C_{sc},1)\\
 \sum_{o=1}^{O} \sum^2_{c=1} U_{oc} &\sim N(U_{tc},1)\\
 \sum_{o=1}^{O} \sum^2_{c=1} W_{oc} &\sim N(W_{tc},.25)\\
-
 \sum_{o=1}^{O} \sum^2_{c=1} D_{oc} &= \sqrt(W_{oc}-U_{oc})^2
-
 \end{aligned}
 $$
 
@@ -43,22 +41,23 @@ $$
 
 niter <- 2000
 nwarmup <- 1000
-num_points <- 50
+num_beacons <- 50
+num_gps <- 100
 test_fix <- 2
 err_sd_wifi <- .25
 err_sd_gps <- 1
 true_sd <- 10
 
-true_points_gps <- matrix(nrow=num_points,c(rnorm(num_points,0,true_sd),rnorm(num_points,0,true_sd)))
-true_points_clust <- matrix(nrow=num_points/true_sd,c(rnorm(num_points/true_sd,0,true_sd),rnorm(num_points/true_sd,0,true_sd)))
+true_points_gps <- matrix(nrow=num_gps,c(rnorm(num_gps,0,true_sd),rnorm(num_gps,0,true_sd)))
+true_points_clust <- matrix(nrow=num_beacons/true_sd,c(rnorm(num_beacons/true_sd,0,true_sd),rnorm(num_beacons/true_sd,0,true_sd)))
 
 true_points_wifi <- apply(true_points_clust,2, function(x) {
-  x <- sapply(x,function(x) rnorm(n=10,mean=x))
+  x <- sapply(x,function(x) rnorm(n=true_sd,mean=x,sd=2))
 })
 
 obs_points_gps <- apply(true_points_gps,c(1,2),function(x) rnorm(n=1,mean=x,sd=err_sd_gps))
 obs_points_wifi <- apply(true_points_wifi,c(1,2), function(x) rnorm(n=1,mean=x,sd=err_sd_wifi))
-distance_obs <- proxy::dist(c(rbind(obs_points_wifi,obs_points_gps))) %>% as.matrix() 
+distance_obs <- proxy::dist(rbind(obs_points_wifi,obs_points_gps)) %>% as.matrix() 
 
 ```
 
@@ -69,9 +68,9 @@ We can show the data by plotting observed and true locations. Below is the simul
 plot_data <- bind_cols(as_data_frame(rbind(obs_points_wifi,obs_points_gps)),
                        as_data_frame(rbind(true_points_wifi,true_points_gps)))
 names(plot_data) <- c('Observed_Lat','Observed_Lon','True_Lat','True_Lon')
-plot_data <- mutate(plot_data,type=rep(c('wifi','gps'),each=num_points),id=1:n(),
-                    point_id=rep(1:num_points,2),
-                    clust_id=c(paste0('clust_',rep(1:5,each=true_sd)),rep(NA,num_points)))
+plot_data <- mutate(plot_data,type=c(rep('wifi',num_beacons),rep('gps',num_gps)),id=1:n(),
+                    point_id=c(1:num_beacons,1:num_gps),
+                    clust_id=c(paste0('clust_',rep(1:5,each=true_sd)),rep(NA,num_gps)))
 
 plot_data <-  gather(plot_data,source,coordinate,-type,-id,-clust_id,-point_id) %>% separate(source,into=c('source','dimension')) %>%
   spread(key = dimension,value = coordinate)
@@ -89,7 +88,7 @@ ggplot(plot_data,aes(y=Lat,x=Lon,shape=source,colour=source)) + geom_point() + t
 ```
 
 
-We see here that the coordinates are pretty close to each other. As a final step, we simulate a process where a user walks through the store from GPS location to GPS location. At each step, the cell phone records distances to all wifi beacons, although any beacons with a distance larger than 10 feet are removed due to the limitations of signal strength. That leaves 749 records or an average of `r round(749/num_points)` beacon signals per longitude/latitude coordinate.
+We see here that the coordinates are pretty close to each other. As a final step, we simulate a process where a user walks through the store from GPS location to GPS location. At each step, the cell phone records distances to all wifi beacons, although any beacons with a distance larger than 10 feet are removed due to the limitations of signal strength. That leaves `r nrow(simul_data)` records or an average of `r round(nrow(simul_data)/num_beacons)` beacon signals per longitude/latitude coordinate.
 
 ```{r walk}
 
@@ -104,10 +103,10 @@ euclid_dist <- data_frame(distance=c(sapply(gps_data$point_id, function(x) {
     })
   return(distance)
 })),
-point_id=rep(gps_data$point_id,each=num_points),wifi_id=rep(wifi_data$point_id,num_points))
+point_id=rep(gps_data$point_id,each=num_beacons),wifi_id=rep(wifi_data$point_id,num_gps))
 
 simul_data <- left_join(plot_data,euclid_dist,by='point_id') %>% group_by(point_id) %>%
-  filter(type=='gps',source=='Observed',distance<10) %>% 
+  filter(type=='gps',source=='Observed',distance<20) %>% 
   left_join(select(wifi_data,point_id,clust_id),by=c('wifi_id'='point_id'))
 
 DT::datatable(select(simul_data,point_id,wifi_id,clust_id.y,Lat,Lon,distance),rownames=FALSE)
@@ -120,14 +119,23 @@ Now that we have generated data from first principles, we can look at how variou
 
 # produce model matrix for Stan
 
+simul_data$wifi_id <- as.numeric(factor(simul_data$wifi_id))
+simul_data$clust_id.y <- as.numeric(factor(simul_data$clust_id.y))
+simul_data$point_id_fac <- as.numeric(factor(simul_data$point_id))
+
+
 theta <- model.matrix(~distance + I(distance^2) + I(distance^3),data = simul_data)[,-1]
 
 stan_data <- list(N=nrow(simul_data),
                   J=ncol(theta),
+                  W=max(simul_data$wifi_id),
                   X=theta,
+                  wifi_id=simul_data$wifi_id,
+                  GPS=length(unique(simul_data$point_id_fac)),
                   longitude=simul_data$Lon,
                   latitude=simul_data$Lat,
-                  G=num_points/true_sd,
+                  gps_id=simul_data$point_id_fac,
+                  G=num_beacons/true_sd,
                   cl=as.numeric(factor(simul_data$clust_id.y)))
 
 compiled <- stan_model(file='hier_linear.stan')
@@ -145,13 +153,19 @@ sample_rows <- sample(1:(2*niter),500)
 latitude <- sapply(sample_rows, function(i) {
 
   out_lat <- sapply(1:nrow(simul_data),function(n) {
-    out_row <- post$loc_lat[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lat[i,]
+    out_row <- post$loc_lat[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lat[i,] +
+      post$gps_fix_lat[i,stan_data$gps_id[n]] + 
+      post$wifi_est[i,stan_data$wifi_id[n],1] +
+      (stan_data$X[n,] %*% post$theta_int[i,,1])*post$wifi_est[i,stan_data$wifi_id[n],1]
   })
 })
 
 longitude <- sapply(sample_rows, function(i) {
   out_lat <- sapply(1:nrow(simul_data),function(n) {
-    out_row <- post$loc_lon[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lon[i,]
+    out_row <- post$loc_lon[i,stan_data$cl[n]] + stan_data$X[n,] %*% post$theta_lon[i,] +
+      post$gps_fix_lon[i,stan_data$gps_id[n]] +
+            post$wifi_est[i,stan_data$wifi_id[n],2] +
+      (stan_data$X[n,] %*% post$theta_int[i,,2])*post$wifi_est[i,stan_data$wifi_id[n],2]
   })
 })
 
@@ -165,8 +179,8 @@ out_data <- left_join(out_data,plot_data,by=c('orig_pts'='point_id')) %>%
   filter(type=='gps',source=='True')
 
 ggplot(out_data,aes(y=lon_mean,x=lat_mean)) + geom_point(colour='blue',size=1.5) +
-  geom_point(aes(y=Lat,x=Lon),colour='red',size=1.5,shape=3) + theme_minimal() +
-  geom_point(data=filter(plot_data,source=='True',type=='wifi'),aes(y=Lat,x=Lon),shape=4,colour='green')
+  geom_point(aes(y=Lon,x=Lat),colour='red',size=1.5,shape=3) + theme_minimal() +
+  geom_point(data=filter(plot_data,source=='True',type=='wifi'),aes(y=Lon,x=Lat),shape=4,colour='green')
 
 ```
 
@@ -182,12 +196,9 @@ However, we model this via a Bayesian estimation so that we can estimate $W_{oc}
 
 ```{r calculate}
 
-simul_data$wifi_id <- as.numeric(factor(simul_data$wifi_id))
-simul_data$clust_id.y <- as.numeric(factor(simul_data$clust_id.y))
-
 # first calculate average wifi location 
 
-wifi_loc <- lapply(1:max(simul_data$wifi_id),
+wifi_loc <- lapply(1:max(simul_data$clust_id.y),
                    function(beacon) {
                      lm_data <- filter(simul_data,wifi_id==beacon)
                      beacon_lat <- lm(Lat~distance + I(distance^2) + I(distance^3),
@@ -207,12 +218,10 @@ wifi_loc <- lapply(1:max(simul_data$wifi_id),
 
 wifi_loc <- mutate(wifi_loc,lat_sd=coalesce(lat_sd,max(lat_sd,na.rm=TRUE)),
                    lon_sd=coalesce(lon_sd,max(lon_sd,na.rm=TRUE)),
-                   wifi_id=1:max(simul_data$wifi_id))
-wifi_loc <- left_join(wifi_loc,select(ungroup(simul_data),clust_id.y,wifi_id),by='wifi_id') %>% 
-  distinct(.keep_all=TRUE)
-sum_wifi <- group_by(wifi_loc,clust_id.y) %>% summarize_all(mean)
-wifi_matrix <- as.matrix(select(sum_wifi,lat_pred,lon_pred))
-sd_matrix <- as.matrix(select(sum_wifi,lat_sd,lon_sd))
+                   cluster_id=1:max(simul_data$clust_id.y))
+
+wifi_matrix <- as.matrix(select(wifi_loc,lat_pred,lon_pred))
+sd_matrix <- as.matrix(select(wifi_loc,lat_sd,lon_sd))
 
 
 compiled <- stan_model(model_name = 'MDSBayes',file = 'stan_mds_full.stan')
@@ -220,10 +229,12 @@ compiled <- stan_model(model_name = 'MDSBayes',file = 'stan_mds_full.stan')
 stan_data <- list(N=nrow(simul_data),
                   W=max(simul_data$wifi_id),
                   C=length(unique(simul_data$clust_id.y)),
-                  clust_id=wifi_loc$clust_id.y,
+                  G=length(unique(simul_data$point_id)),
+                  gps_id=simul_data$point_id_fac,
+                  clust_id=simul_data$clust_id.y,
                   wifi_id=simul_data$wifi_id,
-                  lat_meas=simul_data$Lat,
-                  lon_meas=simul_data$Lon,
+                  lat_meas=unique(simul_data$Lat),
+                  lon_meas=unique(simul_data$Lon),
                   points_dist=simul_data$distance,
                   wifi_center=wifi_matrix,
                   wifi_sd=sd_matrix)
@@ -233,29 +244,39 @@ bayesmds <- sampling(compiled,chains=4,cores=4,iter=niter,warmup=nwarmup,data=st
 
 ```
 
+We can now plot these values against the true longitude/latitude coordinates.
   
-```{r plot}
-to_plot_params <- lapply(all_sims,function(x) {
-  all_out <- as.array(x)
-  all_pars <- attributes(all_out)$dimnames$parameters
-  all_out <- all_out[,,grepl('full\\[',all_pars)]  
-  return(all_out)
-})
+```{r plot_mds}
+post <- rstan::extract(bayesmds,permuted=T)
+sample_rows <- sample(1:(2*niter),500)
+latitude <- post$latitude
 
-to_plot_data <- lapply(to_plot_params,function(x) {
-  outplot <- mcmc_recover_intervals(x,true=c(true_points))
-  return(outplot$data)
-})
+longitude <- post$longitude
 
-combine_data <- bind_rows(to_plot_data)
+out_data_long <- bind_rows(as_data_frame(t(latitude[sample_rows,])),
+                           as_data_frame(t(longitude[sample_rows,]))) %>% 
+  mutate(coord=rep(c('longitude','latitude'),each=length(unique(simul_data$Lon))),
+         orig_pts=rep(unique(simul_data$point_id),2)) %>% 
+  gather(iteration,estimate,-coord,-orig_pts) %>% 
+  left_join(plot_data,by=c('orig_pts'='point_id')) %>% 
+  filter(type=='gps',source=='True') %>% 
+  spread(key=coord,value=estimate)
 
-combine_data$Batch <- factor(paste0(rep(1:test_fix,each=(num_points*2)),'_Fixed'))
-combine_data <- gather(combine_data,type,estimate,True,Point)
+out_data <- data_frame(lat_mean=apply(latitude,2,mean),
+                       lat_sd=apply(latitude,2,sd),
+                       lon_mean=apply(longitude,2,mean),
+                       lon_sd=apply(longitude,2,sd),obs_lat=unique(simul_data$Lat),
+                       obs_lon=unique(simul_data$Lon),orig_pts=unique(simul_data$point_id))
+# merge with true estimates
+out_data <- left_join(out_data,plot_data,by=c('orig_pts'='point_id')) %>% 
+  filter(type=='gps',source=='True')
 
-ggplot(combine_data,aes(y=estimate,x=reorder(Parameter,estimate),colour=type)) + geom_point(aes(shape=type),size=1.5) + 
-  geom_linerange(aes(ymin=l,ymax=u)) +
-  theme_minimal() +
-  facet_trelliscope(~Batch) +
-  theme(panel.grid = element_blank()) +
-  scale_color_brewer(palette='Paired')
+# ggplot(out_data,aes(y=lon_mean,x=lat_mean)) + geom_point(colour='blue',size=1.5) +
+#   geom_point(aes(y=Lon,x=Lat),colour='red',size=1.5,shape=3) + theme_minimal() +
+#   geom_point(data=filter(plot_data,source=='True',type=='wifi'),aes(y=Lon,x=Lat),shape=4,colour='green')
+
+ggplot(out_data_long,aes(y=longitude,x=latitude)) + stat_ellipse(aes(group=orig_pts)) +
+  geom_point(aes(y=Lon,x=Lat),colour='red',size=1.5,shape=3) + theme_minimal() +
+  geom_point(data=filter(plot_data,source=='True',type=='wifi'),aes(y=Lon,x=Lat),shape=4,colour='green') + scale_color_discrete(guide='none')
+
 ```
